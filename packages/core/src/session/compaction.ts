@@ -164,7 +164,7 @@ const serialize = (message: SessionMessage.Info) => {
 const select = (
   messages: readonly SessionMessage.Info[],
   tokens: number,
-): { readonly head: string; readonly recent: string } | undefined => {
+): { readonly headMessages: readonly string[]; readonly recentMessages: readonly string[] } | undefined => {
   const conversation = messages
     .filter((message) => message.type !== "compaction" && message.type !== "system")
     .flatMap((message) => {
@@ -186,15 +186,37 @@ const select = (
     if (latestUser > 0) split = latestUser
   }
   return {
-    head: conversation
-      .slice(0, split)
-      .map((item) => item.text)
-      .join("\n\n"),
-    recent: conversation
-      .slice(split)
-      .map((item) => item.text)
-      .join("\n\n"),
+    headMessages: conversation.slice(0, split).map((item) => item.text),
+    recentMessages: conversation.slice(split).map((item) => item.text),
   }
+}
+
+/**
+ * Bounds a list of already-serialized conversation messages (ordered oldest to
+ * newest) to the given token budget, keeping the newest messages and dropping the
+ * oldest. Truncation happens on whole-message boundaries so a tool call is never
+ * separated from its result. At least the newest message is always kept so the
+ * summary always has some grounding; if that single newest message alone exceeds
+ * the budget it is cut down to the budget, keeping its tail (the newest content).
+ */
+export const boundHead = (messages: readonly string[], tokens: number) => {
+  const kept: string[] = []
+  let used = 0
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index]
+    const next = used + Token.estimate(message)
+    if (used > 0 && next > tokens) break
+    kept.push(message)
+    used = next
+  }
+  // Fallback: a single oversized message is trimmed to the budget (tail kept).
+  if (kept.length === 1 && Token.estimate(kept[0]) > tokens) {
+    const budgetChars = Math.max(0, Math.floor(tokens * 4))
+    kept[0] = kept[0].slice(-budgetChars)
+  }
+  // Restore chronological order (oldest to newest).
+  kept.reverse()
+  return kept.join("\n\n")
 }
 
 export const buildPrompt = (input: { readonly previousSummary?: string; readonly context: readonly string[] }) =>
@@ -207,20 +229,55 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
     ...input.context,
   ].join("\n\n")
 
-const planContent = (messages: readonly SessionMessage.Info[], tokens: number) => {
+const planContent = (
+  messages: readonly SessionMessage.Info[],
+  tokens: number,
+  limit?: { readonly context: number; readonly output: number },
+) => {
   const selected = select(messages, tokens)
   if (!selected) return
   const previousSummary = messages.findLast(
     (message) => message.type === "compaction" && message.status === "completed",
   )
   const previousRecent = previousSummary?.type === "compaction" ? previousSummary.recent : ""
-  const summarizeRecent = !previousRecent && !selected.head
+  const summarizeRecent = !previousRecent && !selected.headMessages.length
+  const previousSummaryText = previousSummary?.type === "compaction" ? previousSummary.summary : undefined
+  // Reserve room for the summary output, bounded by the model's output limit.
+  const output = limit?.output
+  const summaryTokens = Math.max(1, Math.min(output ?? 4_096, 4_096))
+  const context = limit?.context ?? Number.POSITIVE_INFINITY
+  // Fixed prompt overhead that participates in the same budget as the history:
+  // instructions, the summary template, and the previous summary.
+  const fixedOverhead =
+    Token.estimate(previousSummaryText ?? "") +
+    Token.estimate(SUMMARY_TEMPLATE) +
+    Token.estimate("The following is the conversation history:") +
+    (previousSummaryText
+      ? Token.estimate(
+          "Update the anchored summary below using the conversation history above.\nPreserve still-true details, remove stale details, and merge in the new facts.\n<previous-summary>\n</previous-summary>",
+        )
+      : Token.estimate("Create a new anchored summary from the conversation history."))
+  const historyBudget = Number.isFinite(context)
+    ? Math.max(0, Math.floor(context - summaryTokens - fixedOverhead))
+    : Number.POSITIVE_INFINITY
+  // previousRecent and head share the history budget. previousRecent is the newest
+  // history (kept from the previous compaction), so it is preserved first and head
+  // (older) takes whatever budget remains.
+  const boundPreviousRecent =
+    !previousRecent || Token.estimate(previousRecent) <= historyBudget
+      ? previousRecent
+      : boundHead(previousRecent.split("\n\n"), historyBudget)
+  const recentBudget = Math.max(0, historyBudget - Token.estimate(boundPreviousRecent))
+  const head = summarizeRecent || recentBudget <= 0 ? "" : boundHead(selected.headMessages, recentBudget)
+  // In the summarizeRecent case the recent tail is the only history: bound it too so
+  // the request stays within the window even for small contexts.
+  const boundedRecent = summarizeRecent ? boundHead(selected.recentMessages, recentBudget) : ""
   return {
     prompt: buildPrompt({
-      previousSummary: previousSummary?.type === "compaction" ? previousSummary.summary : undefined,
-      context: summarizeRecent ? [selected.recent] : [previousRecent, selected.head].filter(Boolean),
+      previousSummary: previousSummaryText,
+      context: summarizeRecent ? [boundedRecent] : [boundPreviousRecent, head].filter(Boolean),
     }),
-    recent: summarizeRecent ? "" : selected.recent,
+    recent: summarizeRecent ? "" : selected.recentMessages.join("\n\n"),
   }
 }
 
@@ -345,7 +402,7 @@ const make = (dependencies: Dependencies) => {
     return { status: "completed" as const }
   })
   const compact = Effect.fn("SessionCompaction.compact")(function* (input: AutoInput) {
-    const content = planContent(input.messages, state.get().tokens)
+    const content = planContent(input.messages, state.get().tokens, input.resolved.limit)
     if (content)
       return yield* execute({
         session: input.session,
@@ -382,8 +439,10 @@ const make = (dependencies: Dependencies) => {
     return used >= promptCeiling
   }
   const compactManual = Effect.fn("SessionCompaction.compactManual")(function* (input: ManualInput) {
-    const content = planContent(input.messages, state.get().tokens)
-    if (!content)
+    // Check for compactable content first so an empty session fails fast without
+    // triggering model resolution. The model is resolved afterwards so the summary
+    // prompt can be bounded to its context window.
+    if (!planContent(input.messages, state.get().tokens))
       return yield* failed({
         sessionID: input.session.id,
         reason: "manual",
@@ -401,6 +460,14 @@ const make = (dependencies: Dependencies) => {
       ),
     )
     if ("status" in resolved) return resolved
+    const content = planContent(input.messages, state.get().tokens, resolved.limit)
+    if (!content)
+      return yield* failed({
+        sessionID: input.session.id,
+        reason: "manual",
+        error: { type: "compaction.unavailable", message: "Nothing to compact yet" },
+        inputID: input.inputID,
+      })
     return yield* execute({
       session: input.session,
       resolved,

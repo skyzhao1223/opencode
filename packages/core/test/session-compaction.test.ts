@@ -12,6 +12,7 @@ import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
+import { Token } from "@opencode-ai/core/util/token"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { Session } from "@opencode-ai/core/session"
@@ -265,3 +266,111 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
     ])
   }),
 )
+
+test("boundHead truncates oversized head to fit the budget", () => {
+  const huge = Array.from({ length: 200 }, (_, i) => `m${i}-` + "x".repeat(1_000))
+  const budget = 1_000
+  const bounded = SessionCompaction.boundHead(huge, budget)
+
+  expect(SessionCompaction.boundHead(["short"], 100)).toBe("short")
+  expect(Token.estimate(bounded)).toBeLessThanOrEqual(budget)
+  expect(bounded.length).toBeLessThan(huge.join("\n\n").length)
+  // Newest messages survive; the oldest are dropped.
+  expect(bounded).toContain("m199-")
+  expect(bounded).not.toContain("m0-")
+})
+
+test("boundHead keeps whole messages without splitting inside a message", () => {
+  const messages = [
+    `[Assistant tool call]: read_file(...)\n[Tool result]: ${"y".repeat(2_000)}`,
+    `[User]: ${"z".repeat(1_000)}`,
+    `[Assistant]: ${"w".repeat(1_000)}`,
+  ]
+  // m0≈513, m1≈252, m2≈253 tokens. Budget 500 keeps the newest message (m2)
+  // whole and drops the rest without ever splitting inside a message.
+  const budget = 500
+  const bounded = SessionCompaction.boundHead(messages, budget)
+
+  expect(Token.estimate(bounded)).toBeLessThanOrEqual(budget)
+  expect(bounded).toContain("[Assistant]")
+  expect(bounded).not.toContain("[Tool result]")
+  expect(bounded).not.toContain("[User]")
+})
+
+test("boundHead trims a single oversized message to the budget, keeping its tail", () => {
+  const single = ["history-".repeat(1_000)] // ~9k chars ≈ 2250 tokens
+  const budget = 100
+  const bounded = SessionCompaction.boundHead(single, budget)
+
+  expect(Token.estimate(bounded)).toBeLessThanOrEqual(budget)
+  // Tail (newest content) is kept, the head is dropped.
+  expect(bounded.endsWith("history-".repeat(1_000))).toBe(false)
+  expect(bounded.length).toBeLessThan("history-".repeat(1_000).length)
+})
+
+it.effect("auto compaction bounds the summary request within the context window", () =>
+  Effect.gen(function* () {
+    requests = []
+    const db = (yield* Database.Service).db
+    const compaction = yield* SessionCompaction.Service
+    const store = yield* SessionStore.Service
+    const sessionID = Session.ID.make("ses_auto_bound")
+    const parentID = Session.ID.make("ses_auto_bound_parent")
+    yield* db
+      .insert(ProjectTable)
+      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .onConflictDoNothing()
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(SessionTable)
+      .values({
+        id: sessionID,
+        project_id: Project.ID.global,
+        parent_id: parentID,
+        slug: "auto-bound",
+        directory: "/project",
+        title: "Auto bound",
+        version: "test",
+      })
+      .run()
+      .pipe(Effect.orDie)
+
+    const session = yield* store
+      .get(sessionID)
+      .pipe(Effect.flatMap((found) => (found ? Effect.succeed(found) : Effect.die("auto bound session missing"))))
+    const model = LanguageModel.make({
+      id: "bound-model",
+      provider: "test-provider",
+      route: OpenAIChat.route.with({ limits: { context: 4_000, output: 1_000 } }),
+    })
+    // ~40 messages × 2.5k chars ≈ 25k tokens of history, far over the 4k context.
+    const messages = Array.from({ length: 40 }, (_, i) => ({
+      id: SessionMessage.ID.make(`msg_${i}`),
+      type: "user" as const,
+      text: `History message ${i} with plenty of padding. ` + "z".repeat(2_000),
+      time: { created: DateTime.makeUnsafe(i) },
+    }))
+
+    const outcome = yield* compaction.compact({
+      session,
+      messages,
+      resolved: SessionRunnerModel.resolved(model, {
+        capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+        cost: [],
+        limit: { context: 4_000, output: 1_000 },
+      }),
+    })
+    expect(outcome.status).toBe("completed")
+
+    expect(requests).toHaveLength(1)
+    const summaryText = JSON.stringify(requests[0]?.messages)
+    // The summary request must fit the model's context window.
+    expect(Token.estimate(summaryText)).toBeLessThan(4_000)
+    // The bounded head keeps the newest *head* history (message 10) and drops the
+    // oldest head (message 0); the newest recent (message 39) is retained separately.
+    expect(summaryText).toContain("History message 10")
+    expect(summaryText).not.toContain("History message 0")
+  }),
+)
+
