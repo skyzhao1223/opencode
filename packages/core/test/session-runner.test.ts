@@ -2505,7 +2505,7 @@ describe("SessionRunnerLLM", () => {
       expect(yield* Effect.exit(session.resume(sessionID))).toMatchObject({ _tag: "Failure" })
 
       expect(requests).toHaveLength(1)
-      expect(requests[0]?.generation).toBeUndefined()
+      expect(requests[0]?.generation).toEqual({ maxTokens: 50 })
       expect(yield* session.context(sessionID)).toContainEqual(
         expect.objectContaining({
           type: "compaction",
