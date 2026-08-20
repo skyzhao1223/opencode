@@ -308,6 +308,13 @@ test("boundHead trims a single oversized message to the budget, keeping its tail
   expect(bounded.length).toBeLessThan("history-".repeat(1_000).length)
 })
 
+test("boundHead with a zero budget yields empty rather than the full message", () => {
+  const single = ["history-".repeat(1_000)]
+  expect(SessionCompaction.boundHead(single, 0)).toBe("")
+  expect(SessionCompaction.boundHead(["short"], 0)).toBe("")
+  expect(SessionCompaction.boundHead([], 0)).toBe("")
+})
+
 it.effect("auto compaction bounds the summary request within the context window", () =>
   Effect.gen(function* () {
     requests = []

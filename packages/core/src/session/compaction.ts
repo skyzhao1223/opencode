@@ -212,7 +212,8 @@ export const boundHead = (messages: readonly string[], tokens: number) => {
   // Fallback: a single oversized message is trimmed to the budget (tail kept).
   if (kept.length === 1 && Token.estimate(kept[0]) > tokens) {
     const budgetChars = Math.max(0, Math.floor(tokens * 4))
-    kept[0] = kept[0].slice(-budgetChars)
+    // slice(-0) keeps the whole string, so a zero budget must yield empty explicitly.
+    kept[0] = budgetChars === 0 ? "" : kept[0].slice(-budgetChars)
   }
   // Restore chronological order (oldest to newest).
   kept.reverse()
