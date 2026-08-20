@@ -211,9 +211,23 @@ export const boundHead = (messages: readonly string[], tokens: number) => {
   }
   // Fallback: a single oversized message is trimmed to the budget (tail kept).
   if (kept.length === 1 && Token.estimate(kept[0]) > tokens) {
-    const budgetChars = Math.max(0, Math.floor(tokens * 4))
-    // slice(-0) keeps the whole string, so a zero budget must yield empty explicitly.
-    kept[0] = budgetChars === 0 ? "" : kept[0].slice(-budgetChars)
+    // slice(-0) keeps the whole string, so a zero budget yields empty explicitly.
+    if (tokens <= 0) {
+      kept[0] = ""
+    } else {
+      // Trim by estimate rather than a fixed chars-per-token so multilingual text
+      // (where estimate is per-character) is bounded correctly. Binary search on the
+      // longest suffix whose estimate fits the budget keeps this O(n log n).
+      const message = kept[0]
+      let lo = 0
+      let hi = message.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        if (Token.estimate(message.slice(-mid)) <= tokens) lo = mid
+        else hi = mid - 1
+      }
+      kept[0] = message.slice(-lo)
+    }
   }
   // Restore chronological order (oldest to newest).
   kept.reverse()
