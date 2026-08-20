@@ -381,3 +381,38 @@ it.effect("auto compaction bounds the summary request within the context window"
   }),
 )
 
+test("select keeps the recent tail within keep.tokens even in agent-driven sessions", () => {
+  // Agent-driven session: one user turn at the start, then many assistant turns with
+  // synthetic messages in between (as produced by subagents and tool loops).
+  const time = (i: number) => ({ created: i })
+  const messages: SessionMessage.Info[] = [
+    { id: SessionMessage.ID.make("msg_0"), type: "user", text: "user turn", time: time(0) },
+  ]
+  for (let i = 1; i < 300; i++) {
+    if (i % 3 === 0) {
+      messages.push({ id: SessionMessage.ID.make(`msg_${i}`), type: "synthetic", text: "synthetic", time: time(i) })
+    } else {
+      messages.push(
+        Schema.decodeUnknownSync(SessionMessage.Assistant)({
+          id: SessionMessage.ID.make(`msg_${i}`),
+          type: "assistant",
+          agent: Agent.defaultID,
+          model: { id: "test-model", providerID: "test-provider" },
+          content: [{ type: "text", text: `content ${i} ` + "x".repeat(400) }],
+          time: { created: i, completed: i },
+        }),
+      )
+    }
+  }
+
+  const keepTokens = 15_000
+  const selected = SessionCompaction.select(messages, keepTokens)
+  expect(selected).toBeDefined()
+
+  const recent = selected!.recentMessages.join("\n\n")
+  // Hard upper bound from #43250: recent must not exceed keep.tokens even when there
+  // is no recent user turn to anchor the split.
+  expect(Token.estimate(recent)).toBeLessThanOrEqual(keepTokens)
+})
+
+

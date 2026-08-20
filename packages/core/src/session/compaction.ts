@@ -161,7 +161,7 @@ const serialize = (message: SessionMessage.Info) => {
   return ""
 }
 
-const select = (
+export const select = (
   messages: readonly SessionMessage.Info[],
   tokens: number,
 ): { readonly headMessages: readonly string[]; readonly recentMessages: readonly string[] } | undefined => {
@@ -175,21 +175,42 @@ const select = (
   let total = 0
   let split = conversation.length
   for (let index = conversation.length - 1; index >= 0; index--) {
-    const next = total + Token.estimate(conversation[index].text)
+    // Include the join separator ("\n\n") between serialized messages so `total`
+    // matches the estimate of recentMessages.join("\n\n") exactly (#43250).
+    const separator = total > 0 ? Token.estimate("\n\n") : 0
+    const next = total + Token.estimate(conversation[index].text) + separator
     if (split < conversation.length && next > tokens) break
     total = next
     split = index
   }
-  while (split > 0 && conversation[split].message.type !== "user") split--
+  // keep.tokens is a hard upper bound on the retained recent tail (#43250). Prefer a
+  // recent tail that starts on a user-role boundary (synthetic/shell/skill/location
+  // lower to role=user on the wire) so interactive turns are retained verbatim, but
+  // never exceed the budget and never walk back unbounded.
   if (split === 0) {
-    const latestUser = conversation.findLastIndex((item) => item.message.type === "user")
-    if (latestUser > 0) split = latestUser
+    // Whole history fits the budget: keep the newest user-role turn verbatim and
+    // summarize the rest (matches the interactive-session expectation).
+    const newestUserRole = conversation.findLastIndex((item) => isUserRole(item.message.type))
+    if (newestUserRole > 0) split = newestUserRole
+  } else {
+    // Walk back towards a user-role boundary only while the tail still fits.
+    while (split > 0 && !isUserRole(conversation[split].message.type)) {
+      const separator = total > 0 ? Token.estimate("\n\n") : 0
+      const next = total + Token.estimate(conversation[split - 1].text) + separator
+      if (next > tokens) break
+      total = next
+      split--
+    }
   }
   return {
     headMessages: conversation.slice(0, split).map((item) => item.text),
     recentMessages: conversation.slice(split).map((item) => item.text),
   }
 }
+
+/** Messages that lower to role=user on the wire; see runner/to-llm-message.ts. */
+export const isUserRole = (type: SessionMessage.Info["type"]) =>
+  type === "user" || type === "synthetic" || type === "skill" || type === "shell" || type === "location-switched"
 
 /**
  * Bounds a list of already-serialized conversation messages (ordered oldest to
