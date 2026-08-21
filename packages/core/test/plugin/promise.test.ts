@@ -576,4 +576,43 @@ describe("fromPromise", () => {
       })
     }),
   )
+
+  it.effect("registers a tool via the name + definition form", () =>
+    Effect.gen(function* () {
+      const plugins = yield* Plugin.Service
+      const registry = yield* Tool.Service
+      const host = yield* PluginHost.make(plugins)
+      const promisePlugin = define({
+        id: "promise-tool-name-form",
+        setup: async (ctx) => {
+          await ctx.tool.transform((tools) => {
+            tools.add("goodbye", {
+              options: { codemode: false },
+              description: "Say goodbye",
+              input: Schema.Struct({ name: Schema.String }),
+              output: Schema.String,
+              execute: async ({ name }) => ({ output: `Bye, ${name}!` }),
+            })
+          })
+        },
+      })
+
+      yield* PluginPromise.fromPromise(promisePlugin).effect(host)
+
+      const toolSet = yield* registry.snapshot()
+      expect(toolSet.definitions).toContainEqual(expect.objectContaining({ name: "goodbye", description: "Say goodbye" }))
+      expect(
+        yield* toolSet.execute({
+          sessionID: Session.ID.make("ses_promise_tool_name_form"),
+          agent: Agent.ID.make("build"),
+          messageID: SessionMessage.ID.make("msg_promise_tool_name_form"),
+          progress: () => Effect.void,
+          call: { type: "tool-call", id: "call_promise_tool_name_form", name: "goodbye", input: { name: "world" } },
+        }),
+      ).toMatchObject({
+        output: "Bye, world!",
+        content: [{ type: "text", text: "Bye, world!" }],
+      })
+    }),
+  )
 })
