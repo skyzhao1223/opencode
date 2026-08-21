@@ -3,7 +3,7 @@ import { Effect, Schema, SchemaAST, Scope, Stream } from "effect"
 import { HttpApiEndpoint, HttpApiSchema } from "effect/unstable/httpapi"
 import { define } from "../effect/plugin.js"
 import type { Context, Plugin } from "./plugin.js"
-import type { Info } from "./tool.js"
+import type { Info, ToolDraft } from "./tool.js"
 
 type HostRegistration = { readonly dispose: Effect.Effect<void> }
 type Registration = { readonly dispose: () => Promise<void> }
@@ -272,11 +272,15 @@ export function fromPromise(plugin: Plugin) {
               register(
                 host.tool.transform((draft) =>
                   callback({
-                    add: (tool: Info) =>
-                      draft.add({
-                        ...tool,
-                        execute: (input, context) => executePromiseTool(tool, input, context),
-                      }),
+                    add: ((nameOrInfo, tool, options) => {
+                      const withExecute = (info: Info) => ({
+                        ...info,
+                        execute: (input: any, context: any) => executePromiseTool(info, input, context),
+                      })
+                      if (typeof nameOrInfo === "string")
+                        draft.add(nameOrInfo, withExecute(tool as unknown as Info) as any, options)
+                      else draft.add(withExecute(nameOrInfo) as any)
+                    }) as ToolDraft["add"],
                   }),
                 ),
               ),

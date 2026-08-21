@@ -354,7 +354,11 @@ export const make = Effect.fn("PluginHost.make")(function* (
         tools
           .transform((draft) =>
             callback({
-              add: (tool) => draft.add(tool),
+              // tools.add(name, tool, options?) or add(tool) per the plugin docs.
+              add: ((first, second, options) => {
+                if (typeof first === "string") draft.add(first, second, options)
+                else draft.add(first)
+              }) as Tool.ToolAdd,
             }),
           )
           .pipe(Effect.orDie, Effect.as({ dispose: Effect.void })),
