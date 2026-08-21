@@ -75,6 +75,19 @@ const resolved = SessionRunnerModel.resolved(model, {
 const models = Layer.mock(SessionRunnerModel.Service)({
   resolve: () => Effect.succeed(resolved),
 })
+const agents = Layer.mock(Agent.Service)({
+  get: (id) =>
+    Effect.succeed(
+      id === Agent.ID.make("compaction")
+        ? { ...Agent.Info.default(Agent.ID.make("compaction")), system: "You are a summarization assistant." }
+        : undefined,
+    ),
+  resolve: () => Effect.die("unused"),
+  select: () => Effect.die("unused"),
+  list: () => Effect.succeed([]),
+  transform: () => Effect.die("unused"),
+  reload: () => Effect.die("unused"),
+})
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([Database.node, Bus.node, SessionProjector.node, SessionStore.node, SessionCompaction.node]),
@@ -82,6 +95,7 @@ const it = testEffect(
       [Bus.node, Bus.configured({ persist: true })],
       [llmClient, client],
       [SessionRunnerModel.node, models],
+      [Agent.node, agents],
     ],
   ),
 )
@@ -243,6 +257,7 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       "x-opencode-client": "opencode",
     })
     expect(requests[0]?.generation).toBeUndefined()
+    expect(JSON.stringify(requests[0]?.system)).toContain("summarization assistant")
     expect(JSON.stringify(requests[0]?.messages)).toContain("Manual compaction should include this short conversation.")
     expect(yield* store.context(sessionID)).toMatchObject([
       { type: "compaction", reason: "manual", summary: "manual summary", recent: "" },

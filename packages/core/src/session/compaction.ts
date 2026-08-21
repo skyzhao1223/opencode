@@ -76,6 +76,7 @@ type Dependencies = {
     readonly stream: (request: LLMRequest, options?: StreamOptions) => Stream.Stream<LLMEvent, AIError>
   }
   readonly models: SessionRunnerModel.Interface
+  readonly agents: Agent.Interface
   readonly hooks: PluginHooks.Interface
 }
 
@@ -338,6 +339,7 @@ const make = (dependencies: Dependencies) => {
           })
         : Effect.void,
     )
+    const agent = yield* dependencies.agents.get(Agent.ID.make("compaction"))
     const request = yield* SessionModelHook.apply(
       dependencies.hooks,
       { sessionID: plan.session.id, agent: Agent.ID.make("compaction"), model: plan.resolved.ref },
@@ -345,6 +347,7 @@ const make = (dependencies: Dependencies) => {
         model: plan.resolved.model,
         promptCacheKey: SessionPromptCacheKey.make(plan.session.id),
         http: { headers: SessionModelHeaders.make(plan.session, dependencies.app) },
+        system: agent?.system,
         messages: [Message.user(plan.prompt)],
         tools: [],
       }),
@@ -508,13 +511,14 @@ export const layer = Layer.effect(
     const llm = yield* LLMClient.Service
     const models = yield* SessionRunnerModel.Service
     const app = yield* App.Metadata
+    const agents = yield* Agent.Service
     const hooks = yield* PluginHooks.Service
-    return make({ bus, llm, models, app, hooks })
+    return make({ bus, llm, models, app, agents, hooks })
   }),
 )
 
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node, llmClient, SessionRunnerModel.node, App.node, PluginHooks.node],
+  deps: [Bus.node, llmClient, SessionRunnerModel.node, App.node, Agent.node, PluginHooks.node],
 })
