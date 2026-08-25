@@ -1,6 +1,6 @@
 export * as SessionCompaction from "./compaction.js"
 
-import { LLMClient, AIError, LLMEvent, Message, type LLMRequest } from "@opencode-ai/ai"
+import { LLMClient, AIError, LLMEvent, Message, SystemPart, type LLMRequest } from "@opencode-ai/ai"
 import type { StreamOptions } from "@opencode-ai/ai/route"
 import { SessionError } from "@opencode-ai/schema/session-error"
 import { Context, Effect, Layer, Stream } from "effect"
@@ -71,6 +71,7 @@ type Dependencies = {
   }
   readonly models: SessionRunnerModel.Interface
   readonly modelRequests: SessionModelRequest.Interface
+  readonly agents: Agent.Interface
 }
 
 export type AutoInput = {
@@ -167,7 +168,7 @@ const serialize = (message: SessionMessage.Info) => {
   return ""
 }
 
-const select = (
+export const select = (
   messages: readonly SessionMessage.Info[],
   tokens: number,
 ): { readonly head: string; readonly recent: string } | undefined => {
@@ -181,15 +182,30 @@ const select = (
   let total = 0
   let split = conversation.length
   for (let index = conversation.length - 1; index >= 0; index--) {
-    const next = total + Token.estimate(conversation[index].text)
+    // Include the join separator ("\n\n") between serialized messages so `total`
+    // matches the estimate of the joined recent tail exactly (#43250).
+    const separator = total > 0 ? Token.estimate("\n\n") : 0
+    const next = total + Token.estimate(conversation[index].text) + separator
     if (split < conversation.length && next > tokens) break
     total = next
     split = index
   }
-  while (split > 0 && conversation[split].message.type !== "user") split--
+  // keep.tokens is a hard upper bound on the retained recent tail (#43250). Prefer a
+  // recent tail that starts on a user-role boundary (synthetic/shell/skill/location
+  // lower to role=user on the wire), but never walk back beyond the budget.
   if (split === 0) {
-    const latestUser = conversation.findLastIndex((item) => item.message.type === "user")
-    if (latestUser > 0) split = latestUser
+    // Whole history fits the budget: keep the newest user-role turn verbatim and
+    // summarize the rest (matches the interactive-session expectation).
+    const newestUserRole = conversation.findLastIndex((item) => isUserRole(item.message.type))
+    if (newestUserRole > 0) split = newestUserRole
+  } else {
+    while (split > 0 && !isUserRole(conversation[split].message.type)) {
+      const separator = total > 0 ? Token.estimate("\n\n") : 0
+      const next = total + Token.estimate(conversation[split - 1].text) + separator
+      if (next > tokens) break
+      total = next
+      split--
+    }
   }
   return {
     head: conversation
@@ -203,6 +219,10 @@ const select = (
   }
 }
 
+/** Messages that lower to role=user on the wire; see runner/to-llm-message.ts. */
+const isUserRole = (type: SessionMessage.Info["type"]) =>
+  type === "user" || type === "synthetic" || type === "skill" || type === "shell" || type === "location-switched"
+
 export const buildPrompt = (input: { readonly previousSummary?: string; readonly context: readonly string[] }) =>
   [
     input.previousSummary
@@ -213,7 +233,52 @@ export const buildPrompt = (input: { readonly previousSummary?: string; readonly
     ...input.context,
   ].join("\n\n")
 
-const planContent = (messages: readonly SessionMessage.Info[], tokens: number) => {
+/**
+ * Bounds a serialized head to the given token budget, keeping the newest content and
+ * dropping the oldest. Truncation happens on message boundaries (serialized messages
+ * are joined with "\n\n"). At least the newest message is always kept so the summary
+ * has some grounding; a single oversized message is trimmed to the budget keeping its
+ * tail.
+ */
+export const boundHead = (head: string, tokens: number) => {
+  if (Token.estimate(head) <= tokens) return head
+  const parts = head.split("\n\n")
+  const kept: string[] = []
+  let used = 0
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const part = parts[index]
+    const next = used + Token.estimate(part)
+    if (used > 0 && next > tokens) break
+    kept.push(part)
+    used = next
+  }
+  if (kept.length === 1 && Token.estimate(kept[0]) > tokens) {
+    // slice(-0) keeps the whole string, so a zero budget yields empty explicitly.
+    if (tokens <= 0) {
+      kept[0] = ""
+    } else {
+      // Trim by estimate rather than a fixed chars-per-token so multilingual text is
+      // bounded correctly. Binary search on the longest suffix fitting the budget.
+      const message = kept[0]
+      let lo = 0
+      let hi = message.length
+      while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2)
+        if (Token.estimate(message.slice(-mid)) <= tokens) lo = mid
+        else hi = mid - 1
+      }
+      kept[0] = message.slice(-lo)
+    }
+  }
+  kept.reverse()
+  return kept.join("\n\n")
+}
+
+const planContent = (
+  messages: readonly SessionMessage.Info[],
+  tokens: number,
+  limit?: { readonly context: number; readonly output: number },
+) => {
   const selected = select(messages, tokens)
   if (!selected) return
   const previousSummary = messages.findLast(
@@ -222,10 +287,38 @@ const planContent = (messages: readonly SessionMessage.Info[], tokens: number) =
   )
   const previousRecent = previousSummary?.recent ?? ""
   const summarizeRecent = !previousRecent && !selected.head
+  const previousSummaryText = previousSummary?.summary
+  // Reserve room for the summary output, bounded by the model's output limit.
+  const output = limit?.output
+  const summaryTokens = Math.max(1, Math.min(output ?? 4_096, 4_096))
+  const context = limit?.context ?? Number.POSITIVE_INFINITY
+  // Fixed prompt overhead that participates in the same budget as the history.
+  const fixedOverhead =
+    Token.estimate(previousSummaryText ?? "") +
+    Token.estimate(SUMMARY_TEMPLATE) +
+    Token.estimate("The following is the conversation history:") +
+    (previousSummaryText
+      ? Token.estimate(
+          "Update the anchored summary below using the conversation history above.\nPreserve still-true details, remove stale details, and merge in the new facts.\n<previous-summary>\n</previous-summary>",
+        )
+      : Token.estimate("Create a new anchored summary from the conversation history."))
+  const historyBudget = Number.isFinite(context)
+    ? Math.max(0, Math.floor(context - summaryTokens - fixedOverhead))
+    : Number.POSITIVE_INFINITY
+  // previousRecent and head share the history budget. previousRecent is the newest
+  // history (kept from the previous compaction), so it is preserved first and head
+  // (older) takes whatever budget remains.
+  const boundPreviousRecent =
+    !previousRecent || Token.estimate(previousRecent) <= historyBudget
+      ? previousRecent
+      : boundHead(previousRecent, historyBudget)
+  const recentBudget = Math.max(0, historyBudget - Token.estimate(boundPreviousRecent))
+  const head = summarizeRecent || recentBudget <= 0 ? "" : boundHead(selected.head, recentBudget)
+  const boundedRecent = summarizeRecent ? boundHead(selected.recent, recentBudget) : ""
   return {
     prompt: buildPrompt({
-      previousSummary: previousSummary?.summary,
-      context: summarizeRecent ? [selected.recent] : [previousRecent, selected.head].filter(Boolean),
+      previousSummary: previousSummaryText,
+      context: summarizeRecent ? [boundedRecent] : [boundPreviousRecent, head].filter(Boolean),
     }),
     recent: summarizeRecent ? "" : selected.recent,
   }
@@ -273,9 +366,13 @@ const make = (dependencies: Dependencies) => {
           })
         : Effect.void,
     )
+    const agent = yield* dependencies.agents.get(Agent.ID.make("compaction"))
     const prepared = yield* dependencies.modelRequests.prepare({
       scope: { session: plan.session, agentID: Agent.ID.make("compaction"), model: plan.resolved },
-      transcript: { system: [], messages: [Message.user(plan.prompt)] },
+      transcript: {
+        system: agent?.system ? [SystemPart.make(agent.system)] : [],
+        messages: [Message.user(plan.prompt)],
+      },
       contextHooks: false,
     })
     yield* dependencies.llm.stream(prepared.request, prepared.options).pipe(
@@ -338,7 +435,7 @@ const make = (dependencies: Dependencies) => {
     return { status: "completed" as const }
   })
   const compact = Effect.fn("SessionCompaction.compact")(function* (input: AutoInput) {
-    const content = planContent(input.messages, state.get().tokens)
+    const content = planContent(input.messages, state.get().tokens, input.resolved.limit)
     if (content)
       return yield* execute({
         session: input.session,
@@ -374,8 +471,10 @@ const make = (dependencies: Dependencies) => {
     return used >= promptCeiling
   }
   const compactManual = Effect.fn("SessionCompaction.compactManual")(function* (input: ManualInput) {
-    const content = planContent(input.messages, state.get().tokens)
-    if (!content)
+    // Check for compactable content first so an empty session fails fast without
+    // triggering model resolution. The model is resolved afterwards so the summary
+    // prompt can be bounded to its context window.
+    if (!planContent(input.messages, state.get().tokens))
       return yield* failed({
         sessionID: input.session.id,
         reason: "manual",
@@ -393,6 +492,14 @@ const make = (dependencies: Dependencies) => {
       ),
     )
     if ("status" in resolved) return resolved
+    const content = planContent(input.messages, state.get().tokens, resolved.limit)
+    if (!content)
+      return yield* failed({
+        sessionID: input.session.id,
+        reason: "manual",
+        error: { type: "compaction.unavailable", message: "Nothing to compact yet" },
+        inputID: input.inputID,
+      })
     return yield* execute({
       session: input.session,
       resolved,
@@ -418,12 +525,13 @@ export const layer = Layer.effect(
     const llm = yield* LLMClient.Service
     const models = yield* SessionRunnerModel.Service
     const modelRequests = yield* SessionModelRequest.Service
-    return make({ bus, llm, models, modelRequests })
+    const agents = yield* Agent.Service
+    return make({ bus, llm, models, modelRequests, agents })
   }),
 )
 
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node, llmClient, SessionRunnerModel.node, SessionModelRequest.node],
+  deps: [Bus.node, llmClient, SessionRunnerModel.node, SessionModelRequest.node, Agent.node],
 })
