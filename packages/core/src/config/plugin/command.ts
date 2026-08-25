@@ -176,7 +176,9 @@ function evaluateTemplate(
         : withArguments.trim()
     const matches = Array.from(text.matchAll(shellRegex))
     if (matches.length === 0) return text
-    const shell = yield* services.shell.preferred()
+    // Inline bash blocks must run in a POSIX-acceptable shell, not a terminal-only
+    // $SHELL such as fish (#44434).
+    const shell = yield* services.shell.acceptable()
     const outputs = yield* Effect.forEach(
       matches,
       (match) => {

@@ -43,6 +43,7 @@ export type Draft = {
 
 export interface Interface extends State.Transformable<Draft> {
   readonly preferred: () => Effect.Effect<string>
+  readonly acceptable: () => Effect.Effect<string>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ShellSelect") {}
@@ -215,6 +216,7 @@ const layer = (options?: Options) =>
         transform: state.transform,
         reload: state.reload,
         preferred: () => Effect.sync(() => preferred(state.get().shell, options, global.bin)),
+        acceptable: () => Effect.sync(() => acceptable(state.get().shell, options, global.bin)),
       })
     }),
   )
