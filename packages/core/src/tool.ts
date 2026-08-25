@@ -22,9 +22,14 @@ export class RegistrationError extends Schema.TaggedError<RegistrationError>()("
   message: Schema.String,
 }) {}
 
+export interface ToolAdd {
+  (tool: Tool.Info): void
+  (name: string, tool: Omit<Tool.Info, "name">, options?: Tool.Options): void
+}
+
 export interface Interface {
   readonly transform: (
-    callback: (draft: { readonly add: (tool: Tool.Info) => void }) => void,
+    callback: (draft: { readonly add: ToolAdd }) => void,
   ) => Effect.Effect<void, RegistrationError, Scope.Scope>
   readonly snapshot: (permissions?: Permission.Ruleset) => Effect.Effect<Snapshot>
 }
@@ -139,7 +144,22 @@ const layer = Layer.effect(
 
     const transform: Interface["transform"] = Effect.fn("Tool.transform")(function* (callback) {
       const tools: Array<Tool.Info> = []
-      yield* Effect.sync(() => callback({ add: (tool) => tools.push(tool) }))
+      const add = ((
+        nameOrInfo: string | Tool.Info,
+        tool?: Omit<Tool.Info, "name">,
+        options?: Tool.Options,
+      ) => {
+        if (typeof nameOrInfo === "string") {
+          tools.push({
+            ...(tool as Omit<Tool.Info, "name">),
+            name: nameOrInfo,
+            ...(options === undefined ? {} : { options }),
+          })
+        } else {
+          tools.push(nameOrInfo)
+        }
+      }) as ToolAdd
+      yield* Effect.sync(() => callback({ add }))
       yield* Effect.forEach(
         tools.flatMap((tool) => (tool.options?.namespace === undefined ? [] : [tool.options.namespace])),
         validateNamespace,
