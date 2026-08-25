@@ -1076,7 +1076,9 @@ export function Session(props: { verticalTabsWidth: number }) {
                 ) + EOL
 
           if (options.action === "copy") {
-            await clipboard.write(content)
+            // Strip NUL characters: OpenTUI rejects clipboard text containing them,
+            // and both markdown and JSON export content may embed shell output.
+            await clipboard.write(content.replace(/\u0000/g, ""))
             dialog.clear()
             toast.show({ message: "Copied to clipboard", variant: "success" })
             return
@@ -3677,7 +3679,7 @@ function recordValue(value: unknown): Record<string, unknown> | undefined {
   return isRecord(value) ? value : undefined
 }
 
-function formatSessionTranscript(session: SessionInfo, messages: SessionMessageInfo[], thinking: boolean) {
+export function formatSessionTranscript(session: SessionInfo, messages: SessionMessageInfo[], thinking: boolean) {
   const body = messages.flatMap((message) => {
     if (message.type === "user") return [`## User\n\n${message.text}`]
     if (message.type === "shell")
@@ -3699,7 +3701,7 @@ function formatSessionTranscript(session: SessionInfo, messages: SessionMessageI
     })
     return [`## Assistant\n\n${content.join("\n\n")}`]
   })
-  return `# ${withTimestampedFallback(session)}\n\n**Session ID:** ${session.id}\n**Created:** ${new Date(session.time.created).toLocaleString()}\n**Updated:** ${new Date(session.time.updated).toLocaleString()}\n\n---\n\n${body.join("\n\n---\n\n")}\n`
+  return `# ${withTimestampedFallback(session)}\n\n**Session ID:** ${session.id}\n**Created:** ${new Date(session.time.created).toLocaleString()}\n**Updated:** ${new Date(session.time.updated).toLocaleString()}\n\n---\n\n${body.join("\n\n---\n\n")}\n`.replace(/\u0000/g, "")
 }
 
 export function parseApplyPatchFiles(value: unknown) {
