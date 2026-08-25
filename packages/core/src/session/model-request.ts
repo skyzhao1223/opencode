@@ -68,6 +68,7 @@ interface PrepareInput {
     readonly messages: Array<Message>
   }
   readonly toolChoice?: LLM.RequestInput["toolChoice"]
+  readonly generation?: LLM.RequestInput["generation"]
   /**
    * Session context hooks shape the agent conversation. Requests that are not
    * part of the conversation (title, compaction) opt out: their transcripts
@@ -333,6 +334,7 @@ export const layer = Layer.effect(
           messages: boundImages(unsupportedParts(context.messages, resolved.capabilities)),
           tools: Array.from(hooked, ([name, tool]) => ({ ...tool, name })),
           toolChoice: input.toolChoice,
+          generation: input.generation,
         }),
       )
       const hasHttpHooks =

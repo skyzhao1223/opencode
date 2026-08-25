@@ -277,6 +277,10 @@ const make = (dependencies: Dependencies) => {
       scope: { session: plan.session, agentID: Agent.ID.make("compaction"), model: plan.resolved },
       transcript: { system: [], messages: [Message.user(plan.prompt)] },
       contextHooks: false,
+      // Bound the summary output so providers that fall back to the model's full
+      // output limit do not exceed the context window (#42448). The docs promise
+      // at most 4096 output tokens during compaction.
+      generation: { maxTokens: Math.max(1, Math.min(plan.resolved.limit.output, 4_096)) },
     })
     yield* dependencies.llm.stream(prepared.request, prepared.options).pipe(
       Stream.runForEach((event) => {

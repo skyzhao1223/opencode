@@ -259,7 +259,7 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       "x-opencode-session": sessionID,
       "x-opencode-client": "opencode",
     })
-    expect(requests[0]?.generation).toBeUndefined()
+    expect(requests[0]?.generation).toEqual({ maxTokens: 4_096 })
     expect(JSON.stringify(requests[0]?.messages)).toContain("Manual compaction should include this short conversation.")
     expect(yield* store.context(sessionID)).toMatchObject([
       { type: "compaction", reason: "manual", summary: "manual summary", recent: "" },
