@@ -185,7 +185,9 @@ const layer = () =>
         return session.info
       })
 
-      const name = () => shell.preferred().pipe(Effect.map(ShellSelect.name))
+      // Report the same POSIX-acceptable shell that commands actually run in, so the
+      // advertised name matches execution (#44434).
+      const name = () => shell.acceptable().pipe(Effect.map(ShellSelect.name))
 
       const output = Effect.fnUntraced(function* (id: Shell.ID, input?: Shell.OutputInput) {
         const session = yield* require(id)
@@ -230,7 +232,9 @@ const layer = () =>
           command: input.command,
           cwd: input.cwd ?? location.directory,
           timeout: input.timeout,
-          shell: yield* shell.preferred(),
+          // Non-interactive script execution must use a POSIX-acceptable shell: fish/nu
+          // are terminal-only, so $SHELL must not leak into bash-tool commands (#44434).
+          shell: yield* shell.acceptable(),
           env: {
             ...(sessionEnvironment ?? process.env),
             TERM: "xterm-256color",
